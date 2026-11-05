@@ -224,7 +224,9 @@ def _mma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, scale_fn, seman
     return ttgl.tensor(output.handle, acc.type)
 
 
-def _scaled_upcast(src, scale, elem_type, axis, semantic):
+def _scaled_upcast(src, scale, elem_type, axis, semantic, use_lut=False):
+    use_lut = _unwrap_if_constexpr(use_lut)
+    _check(isinstance(use_lut, bool), lambda: "use_lut must be a constexpr boolean")
     _check(isinstance(src.type, ttgl.distributed_type),
            lambda: f"Expected src to have a distributed_type but got {src.type}")
     _check(isinstance(scale.type, ttgl.distributed_type),
@@ -233,6 +235,7 @@ def _scaled_upcast(src, scale, elem_type, axis, semantic):
            lambda: f"Expected elem_type to be fp16 or bf16 but got {elem_type}")
 
     if src.dtype in {ttgl.float8e4nv, ttgl.float8e5}:
+        _check(not use_lut, lambda: "use_lut requires packed fp4 input")
         _check(axis is None, lambda: "axis must be None for fp8 scaled_upcast")
         _check(scale.type.shape == src.type.shape,
                lambda: f"Expected scale shape for fp8 scaled_upcast to be {src.type.shape} but got {scale.type.shape}")
@@ -249,6 +252,8 @@ def _scaled_upcast(src, scale, elem_type, axis, semantic):
 
     handle = semantic.builder.create_scaled_upcast_fp4(src.handle, scale.handle, elem_type.to_ir(semantic.builder),
                                                        axis)
+    if use_lut:
+        handle.set_attr("amdgpu.use_fp4_lut", semantic.builder.get_unit_attr())
     return _wrap_scaled_upcast_result(handle, elem_type, semantic)
 
 

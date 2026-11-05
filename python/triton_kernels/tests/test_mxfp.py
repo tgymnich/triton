@@ -17,7 +17,7 @@ from triton_kernels.numerics_details.mxfp import (
     upcast_from_mxfp_torch,
 )
 from triton_kernels.numerics_details.mxfp_details._upcast_from_mxfp import upcast_mxfp4_tile, upcast_ue8m0_scale, nvfp4_to_mxfp8_tile
-from triton_kernels.target_info import cuda_capability_geq, is_cuda
+from triton_kernels.target_info import cuda_capability_geq, is_cuda, is_hip_cdna5
 from triton_kernels.tensor import convert_layout, wrap_torch_tensor
 from triton_kernels.tensor_details.layout import StridedLayout
 from triton_kernels.testing import assert_close, assert_equal
@@ -47,8 +47,8 @@ def _nvfp4_to_mxfp8_tile_kernel(X, S, Y, YS, M: tl.constexpr, K: tl.constexpr, B
 @pytest.mark.parametrize("k", [160, 256])
 @pytest.mark.parametrize("tensor_scale", [False, True])
 def test_nvfp4_to_mxfp8_tile(block_k, k, tensor_scale, device):
-    if not is_cuda() or not cuda_capability_geq(10, 0):
-        pytest.skip("requires Blackwell")
+    if not (cuda_capability_geq(10, 0) or is_hip_cdna5()):
+        pytest.skip("requires Blackwell or CDNA5")
     torch.manual_seed(42)
     m = 17
     values = torch.randint(0, 256, (m, k // 2), device=device, dtype=torch.uint8)
@@ -60,8 +60,10 @@ def test_nvfp4_to_mxfp8_tile(block_k, k, tensor_scale, device):
         outer_scale = row_scales[torch.arange(m, device=device) % row_scales.numel()]
     actual = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=device)
     actual_scale = torch.empty((m, k // 32), dtype=torch.uint8, device=device)
-    _nvfp4_to_mxfp8_tile_kernel[(triton.cdiv(m, 16), triton.cdiv(k, block_k))](values, scales, actual, actual_scale, m,
-                                                                               k, block_k, outer_scale)
+    kernel = _nvfp4_to_mxfp8_tile_kernel[(triton.cdiv(m, 16), triton.cdiv(k, block_k))](
+        values, scales, actual, actual_scale, m, k, block_k, outer_scale)
+    if is_hip_cdna5():
+        assert "v_perm_pk16_b4_u4" in kernel.asm["amdgcn"]
     decoded = upcast_from_mxfp_torch(values, scales, torch.float32, axis=-1)
     if outer_scale is not None:
         decoded *= outer_scale[:, None]
@@ -72,8 +74,8 @@ def test_nvfp4_to_mxfp8_tile(block_k, k, tensor_scale, device):
 
 @pytest.mark.parametrize("maximum0", range(8))
 def test_nvfp4_to_mxfp8_tile_scale_pairs(maximum0, device):
-    if not is_cuda() or not cuda_capability_geq(10, 0):
-        pytest.skip("requires Blackwell")
+    if not (cuda_capability_geq(10, 0) or is_hip_cdna5()):
+        pytest.skip("requires Blackwell or CDNA5")
     # Every finite nonnegative E4M3 scale pair, with independent FP4 maxima
     # in the two NVFP4 blocks that share one MXFP8 scale.
     cases = torch.arange(127 * 127 * 8, device=device)

@@ -1193,6 +1193,46 @@ SmallVector<Value> upcast8xMxfp4_SW(RewriterBase &rewriter, Operation *op,
          "Expected Fp4ToFpOp or ScaledUpcastFp4Op");
   Location loc = op->getLoc();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
+  if (isaFamily == ISAFamily::CDNA5) {
+    Value input = b.bitcast(packedVec, i32_ty);
+    Value indices = b.undef(vec_ty(i32_ty, 2));
+    indices = b.insert_element(indices, input, b.i32_val(0));
+    indices = b.insert_element(indices, b.i32_val(0), b.i32_val(1));
+    auto lookup = [&](uint64_t lo, uint64_t hi) -> Value {
+      Value tableLo = b.i64_val(lo);
+      Value tableHi = b.i64_val(hi);
+      Value result = createLLVMIntrinsicCallOp(
+                         rewriter, loc, "llvm.amdgcn.perm.pk16.b8.u4",
+                         vec_ty(i32_ty, 4), {tableHi, tableLo, indices})
+                         .getResult(0);
+      return result;
+    };
+
+    // Each nibble indexes the corresponding signed FP4 value's output byte.
+    // FP16's low byte is zero for every FP4 value, including negative zero.
+    Value highWords = toFp16 ? lookup(0x464442403e3c3800, 0xc6c4c2c0bebcb880)
+                             : lookup(0x404040403f3f3f00, 0xc0c0c0c0bfbfbf80);
+    Value lowWords =
+        toFp16 ? LLVM::ZeroOp::create(rewriter, loc, vec_ty(i32_ty, 4))
+               : lookup(0xc0804000c0800000, 0xc0804000c0800000);
+    Type elemTy = toFp16 ? f16_ty : bf16_ty;
+    SmallVector<Value> results;
+    for (int i : llvm::seq(4)) {
+      Value highWord = b.extract_element(highWords, b.i32_val(i / 2));
+      Value lowWord = b.extract_element(lowWords, b.i32_val(i / 2));
+      // Alternate bytes from the low and high tables to form two 16-bit values.
+      Value selector = b.i32_val(i % 2 ? 0x07030602 : 0x05010400);
+      Value pair =
+          createLLVMIntrinsicCallOp(rewriter, loc, "llvm.amdgcn.perm", i32_ty,
+                                    {highWord, lowWord, selector})
+              .getResult(0);
+      Value elements = b.bitcast(pair, vec_ty(elemTy, 2));
+      results.push_back(b.extract_element(elements, b.i32_val(0)));
+      results.push_back(b.extract_element(elements, b.i32_val(1)));
+    }
+    return results;
+  }
+
   auto permU32FnTy =
       LLVM::LLVMFunctionType::get(i32_ty, {i32_ty, i32_ty, i32_ty});
   LLVM::LLVMFuncOp funcOp =

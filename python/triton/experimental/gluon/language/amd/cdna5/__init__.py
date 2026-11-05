@@ -114,7 +114,7 @@ def wmma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, _semantic=None)
 
 
 @builtin
-def scaled_upcast(src, scale, elem_type, axis=None, _semantic=None):
+def scaled_upcast(src, scale, elem_type, axis=None, use_lut=False, _semantic=None):
     """
     Upcast an fp4 or fp8 tensor and fold raw E8M0 scale payload into the
     CDNA5 scaled-upcast op.
@@ -138,12 +138,15 @@ def scaled_upcast(src, scale, elem_type, axis=None, _semantic=None):
       ``axis=1`` and a 32-element scale block, output ``[M, K]`` uses scale
       ``[M, K / 32]``.
 
+    ``use_lut=True`` decodes FP4 through byte lookup tables and applies the
+    scale with FP32 arithmetic. The default uses native scaled conversions.
+
     """
     axis = _unwrap_if_constexpr(axis)
     elem_type = _unwrap_if_constexpr(elem_type)
     assert scale.dtype in (int8, uint8), \
         f"Expected scale to use raw E8M0 payload in int8/uint8 but got {scale.dtype}"
-    return _scaled_upcast(src, scale, elem_type, axis, _semantic)
+    return _scaled_upcast(src, scale, elem_type, axis, _semantic, use_lut=use_lut)
 
 
 @builtin

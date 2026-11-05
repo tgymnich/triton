@@ -23,6 +23,57 @@ from triton.experimental.gluon.language.nvidia.blackwell import TensorMemoryLayo
 THREADS_PER_WARP = triton.runtime.driver.active.get_current_target().warp_size
 
 
+@gluon.jit
+def _fp4_lut_upcast_kernel(X, S, Y, SCALED: ttgl.constexpr, USE_LUT: ttgl.constexpr):
+    layout: ttgl.constexpr = ttgl.BlockedLayout([1, 16], [8, 4], [1, 1], [1, 0])
+    rows = ttgl.program_id(0) * 8 + ttgl.arange(0, 8, layout=ttgl.SliceLayout(1, layout))
+    cols = ttgl.arange(0, 64, layout=ttgl.SliceLayout(0, layout))
+    x = ttgl.load(X + rows[:, None] * 64 + cols[None, :])
+    if SCALED:
+        scale_layout: ttgl.constexpr = ttgl.amd.cdna5.get_scaled_upcast_fp4_scale_layout(
+            x, 32, Y.dtype.element_ty, axis=1)
+        scale_rows = ttgl.program_id(0) * 8 + ttgl.arange(0, 8, layout=ttgl.SliceLayout(1, scale_layout))
+        scale_cols = ttgl.arange(0, 4, layout=ttgl.SliceLayout(0, scale_layout))
+        scale = ttgl.load(S + scale_rows[:, None] * 4 + scale_cols[None, :])
+        y = ttgl.amd.cdna5.scaled_upcast(x, scale, Y.dtype.element_ty, axis=1, use_lut=USE_LUT)
+    else:
+        y = ttgl.fp4_to_fp(x, Y.dtype.element_ty, axis=1)
+    out_layout: ttgl.constexpr = y.type.layout
+    out_rows = ttgl.program_id(0) * 8 + ttgl.arange(0, 8, layout=ttgl.SliceLayout(1, out_layout))
+    out_cols = ttgl.arange(0, 128, layout=ttgl.SliceLayout(0, out_layout))
+    ttgl.store(Y + out_rows[:, None] * 128 + out_cols[None, :], y)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("scaled", [False, True])
+def test_fp4_lut_upcast_all_codes_and_scales(dtype, scaled):
+    packed = torch.arange(64 * 64, device="cuda").to(torch.uint8).reshape(64, 64)
+    scales = torch.arange(256, device="cuda", dtype=torch.uint8).reshape(64, 4)
+    result = torch.empty((64, 128), device="cuda", dtype=dtype)
+    kernel = _fp4_lut_upcast_kernel[(8, )](packed, scales, result, scaled, True, num_warps=1,
+                                          allow_flush_denorm=False)
+    magnitudes = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device="cuda", dtype=torch.float64)
+    codes = torch.stack((packed & 15, packed >> 4), -1).reshape(64, 128).to(torch.int64)
+    expected = magnitudes[codes & 7]
+    expected = torch.where((codes & 8) != 0, -expected, expected)
+    if scaled:
+        exponents = scales.to(torch.int32).repeat_interleave(32, 1)
+        expected = torch.ldexp(expected, exponents - 127)
+        expected = expected.masked_fill(exponents == 255, float("nan"))
+    expected = expected.to(dtype)
+    torch.testing.assert_close(result, expected, rtol=0, atol=0, equal_nan=True)
+    non_nan = ~torch.isnan(expected)
+    assert torch.equal(result.view(torch.int16)[non_nan], expected.view(torch.int16)[non_nan])
+    assert "v_perm_pk16_b8_u4" in kernel.asm["amdgcn"]
+    if scaled:
+        native = torch.empty_like(result)
+        native_kernel = _fp4_lut_upcast_kernel[(8, )](packed, scales, native, True, False, num_warps=1,
+                                                    allow_flush_denorm=False)
+        torch.testing.assert_close(result, native, rtol=0, atol=0, equal_nan=True)
+        assert "v_perm_pk16_b8_u4" not in native_kernel.asm["amdgcn"]
+
+
 def _is_layout_applicable(layout) -> bool:
     if isinstance(layout, (ttgl.BlockedLayout, ttgl.SwizzledSharedLayout, ttgl.DistributedLinearLayout)):
         return True

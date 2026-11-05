@@ -2,7 +2,7 @@ import triton
 import triton.language as tl
 
 from ._downcast_to_mxfp import MXFP_BLOCK_SIZE, NVFP_BLOCK_SIZE
-from triton_kernels.target_info import cuda_capability_geq
+from triton_kernels.target_info import cuda_capability_geq, is_hip_cdna5
 
 
 @triton.jit
@@ -128,6 +128,9 @@ def upcast_nvfp4_tile(tensor, scale, dst_dtype: tl.constexpr):
 
 @triton.jit
 def _mxfp4_maximum_code(values):
+    if is_hip_cdna5():
+        magnitudes = tl.maximum(values & 7, (values >> 4) & 7)
+        return tl.max(magnitudes, 2)
     # Pack explicit groups before the SIMD reduction; inline-asm pack ordering
     # alone does not guarantee that elements belong to the same scale block.
     even, odd = tl.split(values.reshape(values.shape[0], values.shape[1], 2, 2, 2))
@@ -159,6 +162,44 @@ def _mxfp4_maximum_code(values):
 
 
 @triton.jit
+def _upcast_mxfp4_to_fp8(values):
+    # Explicit groups keep the sixteen indices together across layout changes.
+    grouped = values.reshape(values.shape[0], values.shape[1] // 8, 2, 2, 2)
+    even, odd = tl.split(grouped)
+    byte0, byte2 = tl.split(even)
+    byte1, byte3 = tl.split(odd)
+    words = (byte0.to(tl.uint32) | (byte1.to(tl.uint32) << 8)
+             | (byte2.to(tl.uint32) << 16) | (byte3.to(tl.uint32) << 24))
+    lo, hi = tl.split(words)
+    indices = lo.to(tl.uint64) | (hi.to(tl.uint64) << 32)
+    # The two tables hold the low and high nibbles of signed E4M3 encodings.
+    # Packed permutes require nonempty EXEC and a safe instruction after each.
+    low, high = tl.inline_asm_elementwise(
+        """
+        s_cbranch_execz .Lfp4_lut_done${:uid}
+        v_perm_pk16_b4_u4 $0, $4, $3, $2
+        v_nop
+        v_perm_pk16_b4_u4 $1, $6, $5, $2
+        v_nop
+        .Lfp4_lut_done${:uid}:
+        """,
+        constraints="=&v,=v,v,s,s,s,s",
+        args=[indices, tl.full((), 0xc840c800, tl.uint32), tl.full((), 0xc840c800, tl.uint32),
+              tl.full((), 0x44443330, tl.uint32), tl.full((), 0xccccbbb8, tl.uint32)],
+        dtype=(tl.uint64, tl.uint64),
+        is_pure=True,
+        pack=1,
+    )
+    low_words = tl.join(low.to(tl.uint32), (low >> 32).to(tl.uint32))
+    high_words = tl.join(high.to(tl.uint32), (high >> 32).to(tl.uint32))
+    shifts = tl.arange(0, 8) * 4
+    low = (low_words[:, :, :, None] >> shifts[None, None, None, :]) & 15
+    high = (high_words[:, :, :, None] >> shifts[None, None, None, :]) & 15
+    bits = (low | (high << 4)).to(tl.uint8)
+    return bits.reshape(values.shape[0], values.shape[1] * 2).to(tl.float8e4nv, bitcast=True)
+
+
+@triton.jit
 def nvfp4_to_mxfp8_tile(values, scales, tensor_scale=None):
     # Absorb the outer row scale before rounding to MXFP8. The result carries
     # only E4M3 values and E8M0 block scales, with no remaining NVFP4 scale.
@@ -181,9 +222,11 @@ def nvfp4_to_mxfp8_tile(values, scales, tensor_scale=None):
     # block scale preserves FP32 rounding while avoiding per-value scale work.
     block_scale = scales.reshape(values.shape[0], scales.shape[1] // 2, 2)
     block_scale = (block_scale * inverse_scale[:, :, None]).reshape(values.shape[0], scales.shape[1], 1)
-    # Raw FP4 values fit exactly in FP16; promote before any scale arithmetic.
-    # This also lets the compiler use matrix loads for the packed input tile.
-    decoded = _upcast_mxfp4_values(values, tl.float16).to(tl.float32)
+    # FP4 values fit exactly in both intermediate formats. Promote before scaling.
+    if is_hip_cdna5():
+        decoded = _upcast_mxfp4_to_fp8(values).to(tl.float32)
+    else:
+        decoded = _upcast_mxfp4_values(values, tl.float16).to(tl.float32)
     decoded = decoded.reshape(values.shape[0], scales.shape[1], 16)
     quantized = (decoded * block_scale).reshape(values.shape[0], values.shape[1] * 2).to(tl.float8e4nv)
     return quantized, (scale_bits >> 23).to(tl.uint8)

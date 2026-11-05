@@ -275,7 +275,10 @@ struct ScaledUpcastFp4OpPattern
     auto groupScaleReg =
         computeFp4GroupScaleRegisters(upcastOp, inputVals.size());
 
-    if (targetInfo.supportsCvtPkScalePk8Upcast()) {
+    // The LUT path applies each lane's scale without a cross-lane exchange.
+    bool useLut = targetInfo.getISAFamily() == amdgpu::ISAFamily::CDNA5 &&
+                  upcastOp->getAttrOfType<UnitAttr>("amdgpu.use_fp4_lut");
+    if (targetInfo.supportsCvtPkScalePk8Upcast() && !useLut) {
       // FP4/FP6 v_cvt_scale_pk8 with opSel=0 sources the scale for output
       // lanes 16..31 from byte 1 of the *lower* 16 lanes' Vscale while output
       // lanes 0..15 use byte 0. When the scale layout is not broadcast across
@@ -314,7 +317,7 @@ struct ScaledUpcastFp4OpPattern
 
         results.append(converted.begin(), converted.end());
       }
-    } else if (targetInfo.supportsHwScaledUpcast()) {
+    } else if (targetInfo.supportsHwScaledUpcast() && !useLut) {
       for (int i = 0; i < inputVals.size(); i += 4) {
         int scaleIdx = groupScaleReg[i / 4];
         SmallVector<Value> converted =
@@ -348,16 +351,18 @@ struct ScaledUpcastFp4OpPattern
             vF32 = b.fpext(f32_ty, v8vals[j]);
           } else {
             // bf16 → f32 via bit manipulation (gfx9 lacks native bf16 VALU)
-            vF32 = b.bitcast(b.shl(b.zext(i32_ty, b.bitcast(v8vals[j], i16_ty)),
-                                   b.i32_val(16)),
-                             f32_ty);
+            Value bits16 = b.bitcast(v8vals[j], i16_ty);
+            Value bits32 = b.zext(i32_ty, bits16);
+            Value shifted = b.shl(bits32, b.i32_val(16));
+            vF32 = b.bitcast(shifted, f32_ty);
           }
           Value mulF32 = b.fmul(vF32, scaleF32);
           if (toFp16) {
             results.push_back(b.fptrunc(f16_ty, mulF32));
           } else {
-            Value mulI16 = b.trunc(
-                i16_ty, b.lshr(b.bitcast(mulF32, i32_ty), b.i32_val(16)));
+            Value mulI32 = b.bitcast(mulF32, i32_ty);
+            Value shifted = b.lshr(mulI32, b.i32_val(16));
+            Value mulI16 = b.trunc(i16_ty, shifted);
             results.push_back(b.bitcast(mulI16, bf16_ty));
           }
         }

@@ -3,6 +3,59 @@
 
 // -----
 
+#packed_lut = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [1, 32], warpsPerCTA = [1, 1], order = [1, 0]}>
+#unpacked_lut = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [1, 32], warpsPerCTA = [1, 1], order = [1, 0]}>
+#scale_lut = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // COMMON-LABEL: llvm.func @fp4_lut_f16
+  // COMMON-COUNT-4: llvm.call_intrinsic "llvm.amdgcn.perm.pk16.b8.u4"
+  // COMMON-NOT: llvm.call_intrinsic "llvm.amdgcn.perm.pk16.b8.u4"
+  // COMMON: llvm.return
+  tt.func public @fp4_lut_f16(%x: tensor<1x512xi8, #packed_lut>, %out: tensor<1x1024x!tt.ptr<f16>, #unpacked_lut>) {
+    %y = ttg.fp4_to_fp %x {axis = 1 : i32} : tensor<1x512xi8, #packed_lut> -> tensor<1x1024xf16, #unpacked_lut>
+    tt.store %out, %y : tensor<1x1024x!tt.ptr<f16>, #unpacked_lut>
+    tt.return
+  }
+
+  // COMMON-LABEL: llvm.func @fp4_lut_bf16
+  // COMMON-COUNT-8: llvm.call_intrinsic "llvm.amdgcn.perm.pk16.b8.u4"
+  // COMMON-NOT: llvm.call_intrinsic "llvm.amdgcn.perm.pk16.b8.u4"
+  // COMMON: llvm.return
+  tt.func public @fp4_lut_bf16(%x: tensor<1x512xi8, #packed_lut>, %out: tensor<1x1024x!tt.ptr<bf16>, #unpacked_lut>) {
+    %y = ttg.fp4_to_fp %x {axis = 1 : i32} : tensor<1x512xi8, #packed_lut> -> tensor<1x1024xbf16, #unpacked_lut>
+    tt.store %out, %y : tensor<1x1024x!tt.ptr<bf16>, #unpacked_lut>
+    tt.return
+  }
+
+  // COMMON-LABEL: llvm.func @scaled_fp4_lut_f16
+  // COMMON-NOT: rocdl.permlanex16
+  // COMMON-COUNT-4: llvm.call_intrinsic "llvm.amdgcn.perm.pk16.b8.u4"
+  // COMMON: llvm.fmul
+  // COMMON-NOT: rocdl.cvt.scale.pk8.f16.fp4
+  // COMMON-NOT: rocdl.permlanex16
+  // COMMON: llvm.return
+  tt.func public @scaled_fp4_lut_f16(%x: tensor<1x512xi8, #packed_lut>, %scale: tensor<1x32xi8, #scale_lut>, %out: tensor<1x1024x!tt.ptr<f16>, #unpacked_lut>) {
+    %y = amdg.scaled_upcast_fp4 %x scale %scale {axis = 1 : i32, amdgpu.use_fp4_lut} : tensor<1x512xi8, #packed_lut>, tensor<1x32xi8, #scale_lut> -> tensor<1x1024xf16, #unpacked_lut>
+    tt.store %out, %y : tensor<1x1024x!tt.ptr<f16>, #unpacked_lut>
+    tt.return
+  }
+
+  // COMMON-LABEL: llvm.func @scaled_fp4_lut_bf16
+  // COMMON-NOT: rocdl.permlanex16
+  // COMMON-COUNT-8: llvm.call_intrinsic "llvm.amdgcn.perm.pk16.b8.u4"
+  // COMMON: llvm.fmul
+  // COMMON-NOT: rocdl.cvt.scale.pk8.bf16.fp4
+  // COMMON-NOT: rocdl.permlanex16
+  // COMMON: llvm.return
+  tt.func public @scaled_fp4_lut_bf16(%x: tensor<1x512xi8, #packed_lut>, %scale: tensor<1x32xi8, #scale_lut>, %out: tensor<1x1024x!tt.ptr<bf16>, #unpacked_lut>) {
+    %y = amdg.scaled_upcast_fp4 %x scale %scale {axis = 1 : i32, amdgpu.use_fp4_lut} : tensor<1x512xi8, #packed_lut>, tensor<1x32xi8, #scale_lut> -> tensor<1x1024xbf16, #unpacked_lut>
+    tt.store %out, %y : tensor<1x1024x!tt.ptr<bf16>, #unpacked_lut>
+    tt.return
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
 #mma = #ttg.amd_wmma<{version = 3, ctaLayout = {warp = [[0, 1], [1, 0]]}, isTranspose = true, instrShape = [16, 16, 32]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {

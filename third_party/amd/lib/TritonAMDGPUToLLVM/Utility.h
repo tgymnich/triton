@@ -150,8 +150,7 @@ bool isChainDotTail(mlir::triton::DotOpInterface dotOp);
 Value convertF8ToF32_SW(RewriterBase &rewriter, Location loc, Value fp8Val,
                         bool isE4M3FN);
 
-// Software implementation of converting an 8-element vector of MXFP4 elements
-// to a wider type: BF16 or FP16 for target before CDNA4.
+// Convert eight packed MXFP4 values to BF16 or FP16 using byte lookup tables.
 SmallVector<Value> upcast8xMxfp4_SW(RewriterBase &rewriter, Operation *op,
                                     bool toFp16, Value packedVec,
                                     mlir::triton::amdgpu::ISAFamily isaFamily);
